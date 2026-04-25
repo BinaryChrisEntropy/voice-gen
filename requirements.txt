@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+streamlit
+requests
+transformers>=4.45.0
+torch
+torchaudio
+sentencepiece
+flash-attn
+numpy
+openai-whisper
+librosa
