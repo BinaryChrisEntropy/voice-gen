@@ -133,7 +133,7 @@ def main():
             elif not status:
                 st.error("Backend is not responding. Please check your FastAPI server.")
             else:
-                with st.spinner("Processing with MOSS-TTS (8B) and Whisper..."):
+                with st.spinner("Processing with MOSS-TTS..."):
                     try:
                         # Get data from selected voice
                         voice_data = st.session_state.uploaded_voices[selected_voice_name]

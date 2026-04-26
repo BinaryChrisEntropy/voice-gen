@@ -61,8 +61,8 @@ def load_models(device, dtype):
 @app.on_event("startup")
 async def startup_event():
     # To enable, uncomment:
-    # app.state.model, app.state.processor = load_models(DEVICE, DTYPE)
-    pass
+    app.state.model, app.state.processor = load_models(DEVICE, DTYPE)
+    #pass
 
 @app.get("/status")
 async def get_status():
@@ -105,7 +105,9 @@ async def generate_audio(
             conversations = [[processor.build_user_message(text=text)]]
             mode = "generation"
 
-        # Generate using the simpler HF approach
+        # Generate audio
+        import scipy.io.wavfile as wavfile
+
         with torch.no_grad():
             batch = processor(conversations, mode=mode)
             input_ids = batch["input_ids"].to(device=DEVICE)
@@ -117,16 +119,34 @@ async def generate_audio(
                 max_new_tokens=4096,
             )
 
-            # Decode and get audio
-            decoded = processor.decode(outputs)
-            generated_audio = decoded[0].audio_codes_list[0]
-            
-            # Export to WAV
-            out_io = io.BytesIO()
-            torchaudio.save(out_io, generated_audio.unsqueeze(0), processor.model_config.sampling_rate, format="wav")
-            out_io.seek(0)
-            
-            return Response(content=out_io.read(), media_type="audio/wav")
+        # Decode and get audio (already a waveform tensor)
+        decoded = processor.decode(outputs)
+        generated_audio = decoded[0].audio_codes_list[0]
+
+        # Ensure it is a 2D tensor [channels, time]
+        if generated_audio.ndim == 1:
+            generated_audio = generated_audio.unsqueeze(0)
+
+        generated_audio = generated_audio.cpu().float()
+
+        # Normalize audio to [-1, 1]
+        max_val = generated_audio.abs().max()
+        if max_val > 0:
+            generated_audio = generated_audio / max_val
+
+        # Convert to int16 PCM and save as WAV
+        audio_int16 = (generated_audio * 32767).to(torch.int16).squeeze().numpy()
+
+        sr = getattr(processor.model_config, "sampling_rate", 24000)
+        if not sr:
+            sr = 24000
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp_out:
+            wavfile.write(tmp_out.name, sr, audio_int16)
+            with open(tmp_out.name, "rb") as f:
+                content = f.read()
+
+        return Response(content=content, media_type="audio/wav")
 
     except Exception as e:
         print(f"Generation error: {e}")
