@@ -9,5 +9,4 @@ torchaudio
 sentencepiece
 flash-attn
 numpy
-openai-whisper
 librosa

@@ -1,26 +1,25 @@
 import torch
 import torchaudio
-import whisper
 import io
 import os
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import tempfile
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
 from transformers import AutoModel, AutoProcessor
-import numpy as np
 
 app = FastAPI(title="AudioXVoiceGen API")
 
-# Global variables for model and processor
-model = None
-processor = None
-whisper_model = None
-device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.bfloat16 if device == "cuda" else torch.float32
+# Configuration as constants
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
-def load_models():
-    global model, processor, whisper_model
+# Initialize app state
+app.state.model = None
+app.state.processor = None
+
+def load_models(device, dtype):
+    """Loads the models and returns them instead of setting globals."""
     try:
         print(f"Loading MOSS-TTS model on {device}...")
         pretrained_model_name_or_path = "OpenMOSS-Team/MOSS-TTS"
@@ -32,87 +31,85 @@ def load_models():
         )
         processor.audio_tokenizer = processor.audio_tokenizer.to(device)
 
+        # Resolve attention implementation
+        attn_implementation = "sdpa"
+        if device == "cuda":
+            try:
+                import importlib.util
+                if importlib.util.find_spec("flash_attn") is not None and dtype in {torch.float16, torch.bfloat16}:
+                    major, _ = torch.cuda.get_device_capability()
+                    if major >= 8:
+                        attn_implementation = "flash_attention_2"
+            except:
+                pass
+
         # Load MOSS-TTS Model
-        # Using flash_attention_2 if possible (optimized for A100/H100 on DGX)
         model = AutoModel.from_pretrained(
             pretrained_model_name_or_path,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2" if device == "cuda" else "sdpa",
+            attn_implementation=attn_implementation,
             torch_dtype=dtype,
         ).to(device)
         model.eval()
 
-        print("Loading Whisper model for transcription...")
-        whisper_model = whisper.load_model("base", device=device)
-        
         print("All models loaded successfully.")
+        return model, processor
     except Exception as e:
         print(f"Error loading models: {e}")
-        # On local dev machine without 24GB VRAM, this will likely fail.
-        # But we keep it as is for the DGX Spark.
+        return None, None
 
 @app.on_event("startup")
 async def startup_event():
-    # Only load models if we are not in a limited environment
-    # In a real DGX, we would always load.
-    #load_models()
+    # To enable, uncomment:
+    # app.state.model, app.state.processor = load_models(DEVICE, DTYPE)
     pass
 
 @app.get("/status")
 async def get_status():
     return {
-        "model_loaded": model is not None,
-        "device": device,
-        "dtype": str(dtype)
+        "model_loaded": app.state.model is not None,
+        "device": DEVICE,
+        "dtype": str(DTYPE)
     }
 
 @app.post("/generate")
 async def generate_audio(
+    request: Request,
     text: str = Form(...),
     reference_audio: UploadFile = File(None)
 ):
+    # Access models via app.state
+    model = request.app.state.model
+    processor = request.app.state.processor
+
     if model is None or processor is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
+    temp_path = None
     try:
         if reference_audio:
-            # VOICE CLONING MODE
-            audio_bytes = await reference_audio.read()
-            audio_io = io.BytesIO(audio_bytes)
-            ref_audio, sr = torchaudio.load(audio_io)
-            ref_audio = ref_audio[0] # Ensure single channel
+            # Save uploaded file to a temporary location for the processor
+            suffix = os.path.splitext(reference_audio.filename)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                content = await reference_audio.read()
+                tmp.write(content)
+                temp_path = tmp.name
             
-            # Transcribe reference audio using Whisper
-            # MOSS-TTS needs the transcription of the reference to 'prime' the voice
-            temp_path = "temp_ref.wav"
-            with open(temp_path, "wb") as f:
-                f.write(audio_bytes)
-            
-            result = whisper_model.transcribe(temp_path)
-            ref_text = result["text"]
-            os.remove(temp_path)
-            
-            print(f"Ref Audio Transcribed: {ref_text}")
-            
-            # Build conversation for cloning
+            # Use the HF style: reference argument in build_user_message
             conversations = [
-                [
-                    processor.build_user_message(text=ref_text + " " + text),
-                    processor.build_assistant_message(audio_codes_list=[ref_audio])
-                ]
+                [processor.build_user_message(text=text, reference=[temp_path])]
             ]
-            mode = "continuation"
+            mode = "generation"
         else:
-            # TEXT-TO-SPEECH MODE (using a default voice or prompt)
-            # For simplicity, we'll assume the user always provides a reference for cloning in this app.
-            # If not, MOSS-TTS might need a default priming.
-            raise HTTPException(status_code=400, detail="Reference audio is required for this implementation of cloning.")
+            # Direct TTS mode
+            conversations = [[processor.build_user_message(text=text)]]
+            mode = "generation"
 
-        # Generate
+        # Generate using the simpler HF approach
         with torch.no_grad():
             batch = processor(conversations, mode=mode)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device=DEVICE)
+            attention_mask = batch["attention_mask"].to(device=DEVICE)
 
             outputs = model.generate(
                 input_ids=input_ids,
@@ -120,7 +117,7 @@ async def generate_audio(
                 max_new_tokens=4096,
             )
 
-            # Decode
+            # Decode and get audio
             decoded = processor.decode(outputs)
             generated_audio = decoded[0].audio_codes_list[0]
             
@@ -134,6 +131,10 @@ async def generate_audio(
     except Exception as e:
         print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temporary file
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
