@@ -22,11 +22,11 @@ def load_models(device, dtype):
     """Loads the models and returns them instead of setting globals."""
     try:
         print(f"Loading MOSS-TTS model on {device}...")
-        pretrained_model_name_or_path = "OpenMOSS-Team/MOSS-TTS"
+        model_id = "OpenMOSS-Team/MOSS-TTS"
         
         # Load MOSS-TTS Processor
         processor = AutoProcessor.from_pretrained(
-            pretrained_model_name_or_path,
+            model_id,
             trust_remote_code=True
         )
         processor.audio_tokenizer = processor.audio_tokenizer.to(device)
@@ -45,7 +45,7 @@ def load_models(device, dtype):
 
         # Load MOSS-TTS Model
         model = AutoModel.from_pretrained(
-            pretrained_model_name_or_path,
+            model_id,
             trust_remote_code=True,
             attn_implementation=attn_implementation,
             torch_dtype=dtype,
