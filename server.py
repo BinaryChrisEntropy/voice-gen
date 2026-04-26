@@ -55,7 +55,8 @@ def load_models():
 async def startup_event():
     # Only load models if we are not in a limited environment
     # In a real DGX, we would always load.
-    load_models()
+    #load_models()
+    pass
 
 @app.get("/status")
 async def get_status():
